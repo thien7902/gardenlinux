@@ -1,0 +1,6 @@
+---
+type: element
+description: Pre-import container images into containerd content store at build time to eliminate first-boot pull latency
+include:
+  - chost
+  - khost

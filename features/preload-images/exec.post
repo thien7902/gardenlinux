@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Pre-import container images into the target rootfs containerd content store.
+# Layers are unpacked into the overlayfs snapshotter so node boot requires
+# zero image pulls and zero layer extraction — container create is immediate.
+set -Eeuo pipefail
+
+rootfs="$1"
+
+IMAGES=(
+    "registry.k8s.io/pause:3.10"
+    "registry.k8s.io/kube-proxy:v1.35.0"
+    "quay.io/calico/node:v3.29.0"
+    "quay.io/calico/cni:v3.29.0"
+    "quay.io/calico/kube-controllers:v3.29.0"
+)
+
+CONTAINERD_STATE="/tmp/containerd-preload-state-$$"
+CONTAINERD_SOCK="$CONTAINERD_STATE/containerd.sock"
+CONTAINERD_ROOT="$rootfs/var/lib/containerd"
+
+mkdir -p "$CONTAINERD_STATE" "$CONTAINERD_ROOT"
+
+cleanup() {
+    kill "$CTR_PID" 2>/dev/null || true
+    wait "$CTR_PID" 2>/dev/null || true
+    umount "$rootfs/proc" "$rootfs/sys" "$rootfs/dev" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# overlayfs snapshotter needs /proc and /sys visible under the rootfs path
+mount --bind /proc "$rootfs/proc"
+mount --bind /sys  "$rootfs/sys"
+mount --bind /dev  "$rootfs/dev"
+
+# Launch containerd with rootfs config but state+socket outside the rootfs
+# so no stale socket ends up in the final image
+containerd \
+    --config  "$rootfs/etc/containerd/config.toml" \
+    --root    "$CONTAINERD_ROOT" \
+    --state   "$CONTAINERD_STATE" \
+    --address "$CONTAINERD_SOCK" \
+    &>/tmp/containerd-preload.log &
+CTR_PID=$!
+
+echo "Waiting for containerd..."
+for i in $(seq 1 30); do
+    ctr --address "$CONTAINERD_SOCK" version &>/dev/null && break
+    sleep 1
+done
+ctr --address "$CONTAINERD_SOCK" version &>/dev/null || {
+    echo "ERROR: containerd did not start:" >&2
+    cat /tmp/containerd-preload.log >&2
+    exit 1
+}
+
+for image in "${IMAGES[@]}"; do
+    echo "Preloading: $image"
+    ctr \
+        --address  "$CONTAINERD_SOCK" \
+        --namespace k8s.io \
+        images pull \
+        --snapshotter overlayfs \
+        "$image"
+done
+
+echo "Done: preloaded ${#IMAGES[@]} images into $CONTAINERD_ROOT"
