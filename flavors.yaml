@@ -571,7 +571,7 @@ targets:
         publish: false
       - features:
           - khost
-          - preload-images
+          - preloadimages
           - _prod
         arch: amd64
         build: true
@@ -580,7 +580,7 @@ targets:
         publish: false
       - features:
           - khost
-          - preload-images
+          - preloadimages
           - _prod
         arch: arm64
         build: true
@@ -755,6 +755,15 @@ targets:
   - name: openstack
     category: hypervisor
     flavors:
+      - features:
+          - gardener
+          - _prod
+          - preloadimages
+        arch: amd64
+        build: true
+        test: false
+        test-platform: false
+        publish: false
       - features:
           - gardener
           - _prod

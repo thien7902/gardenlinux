@@ -1,10 +1,10 @@
-# SRS: preload-images Feature
+# SRS: preloadimages Feature
 
 ## 1. Bối cảnh
 
 Khi một Kubernetes node boot từ GardenLinux image và join cluster, một trong những bước tốn thời gian nhất là pull container images (kube-proxy, CNI, pause...) từ registry. Với network chậm hoặc registry bị throttle, bước này có thể mất 1–5 phút.
 
-Feature `preload-images` giải quyết vấn đề này bằng cách bake sẵn các images vào OS image tại build time — node boot lên là containerd đã có images, không pull gì cả.
+Feature `preloadimages` giải quyết vấn đề này bằng cách bake sẵn các images vào OS image tại build time — node boot lên là containerd đã có images, không pull gì cả.
 
 ---
 
@@ -77,7 +77,7 @@ kubelet và containerd CRI đọc images từ namespace `k8s.io`. Pull phải d�
 ## 4. Cấu trúc file
 
 ```
-features/preload-images/
+features/preloadimages/
 ├── info.yaml     ← khai báo feature: type element, include chost + khost
 ├── exec.post     ← script chính: pull + unpack images vào rootfs
 └── SRS.md        ← tài liệu này
@@ -89,13 +89,13 @@ features/preload-images/
 
 ### 5.1 Thêm vào flavor
 
-Mở `flavors.yaml`, thêm `preload-images` vào danh sách features của flavor muốn dùng:
+Mở `flavors.yaml`, thêm `preloadimages` vào danh sách features của flavor muốn dùng:
 
 ```yaml
 # Ví dụ: thêm cho kvm flavor có khost
 - features:
     - khost
-    - preload-images
+    - preloadimages
     - _prod
   arch: amd64
   build: true
@@ -103,11 +103,11 @@ Mở `flavors.yaml`, thêm `preload-images` vào danh sách features của flavo
   publish: true
 ```
 
-> `preload-images` đã include `chost` và `khost` qua `info.yaml` nên không cần khai báo lại, nhưng khai báo thêm cũng không sao.
+> `preloadimages` đã include `chost` và `khost` qua `info.yaml` nên không cần khai báo lại, nhưng khai báo thêm cũng không sao.
 
 ### 5.2 Cập nhật danh sách images
 
-Mở `features/preload-images/exec.post`, sửa mảng `IMAGES`:
+Mở `features/preloadimages/exec.post`, sửa mảng `IMAGES`:
 
 ```bash
 IMAGES=(
@@ -124,7 +124,7 @@ Luôn pin version cụ thể (`v3.29.0`), không dùng `latest`.
 ### 5.3 Build image
 
 ```bash
-# Từ root repo, build flavor kvm với preload-images
+# Từ root repo, build flavor kvm với preloadimages
 ./build kvm-amd64
 
 # Hoặc qua make
@@ -151,7 +151,7 @@ Expected output: tất cả images trong `IMAGES` array phải xuất hiện v�
 # Trên node sau khi join cluster, đo thời gian từ boot đến kubelet Ready
 journalctl -u kubelet --no-pager | grep -E "Starting kubelet|Successfully registered node"
 
-# So sánh với node không dùng preload-images
+# So sánh với node không dùng preloadimages
 # Thông thường tiết kiệm 60-180s tùy băng thông và số images
 ```
 
