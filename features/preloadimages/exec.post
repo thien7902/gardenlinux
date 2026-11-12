@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# Pre-import container images into the target rootfs containerd content store.
+# Layers are unpacked into the overlayfs snapshotter so node boot requires
+# zero image pulls and zero layer extraction — container create is immediate.
+set -Eeuo pipefail
+
+rootfs="$1"
+
+# Registry credentials: ~/.docker/config.json is mounted at /mnt/docker-config.json
+# (the builder network reaches registry.fke.fptcloud.com but it requires Basic auth).
+# Parse the base64 auth for the FKE registry into a User:password string for ctr.
+REGISTRY_AUTH_USERPASS=""
+DOCKER_CONFIG="/mnt/docker-config.json"
+FKE_REGISTRY="registry.fke.fptcloud.com"
+if [ -f "$DOCKER_CONFIG" ]; then
+    REGISTRY_AUTH_USERPASS="$(python3 - "$DOCKER_CONFIG" "$FKE_REGISTRY" <<'PY' 2>/dev/null || true
+import json, sys, base64
+cfg, reg = sys.argv[1], sys.argv[2]
+try:
+    a = json.load(open(cfg))["auths"][reg]["auth"]
+    print(base64.b64decode(a).decode())
+except Exception:
+    pass
+PY
+)"
+fi
+[ -n "$REGISTRY_AUTH_USERPASS" ] || echo "Warning: no auth for $FKE_REGISTRY in $DOCKER_CONFIG; pulls may 401" >&2
+
+IMAGES=(
+    # Core K8s node components (registry mirror at registry.fke.fptcloud.com).
+    "registry.fke.fptcloud.com/xplat-fke/pause:3.10"
+    "registry.fke.fptcloud.com/xplat-fke/kube-proxy:v1.34.0"
+    "registry.fke.fptcloud.com/xplat-fke/gardener-project/releases/hyperkube:v1.34.6"
+
+    # Calico CNI (matches the cluster's calico v3.31.6).
+    "registry.fke.fptcloud.com/xplat-fke/calico/node:v3.31.6"
+    "registry.fke.fptcloud.com/xplat-fke/calico/cni:v3.31.6"
+    "registry.fke.fptcloud.com/xplat-fke/calico/typha:v3.31.6"
+    "registry.fke.fptcloud.com/xplat-fke/calico/kube-controllers:v3.31.6"
+
+    # DNS, metrics, monitoring.
+    "registry.fke.fptcloud.com/xplat-fke/dns/k8s-dns-node-cache:1.26.7"
+    "registry.fke.fptcloud.com/xplat-fke/coredns/coredns:v1.13.2"
+    "registry.fke.fptcloud.com/xplat-fke/metrics-server/metrics-server:v0.8.0"
+    "registry.fke.fptcloud.com/xplat-fke/node-problem-detector/node-problem-detector:v1.34.2"
+    "registry.fke.fptcloud.com/xplat-fke/prometheus/node-exporter:v1.10.2"
+    "registry.fke.fptcloud.com/xplat-fke/prometheus/blackbox-exporter:v0.28.0"
+
+    # Gardener add-ons.
+    "registry.fke.fptcloud.com/xplat-fke/gardener-project/releases/gardener/apiserver-proxy:v0.20.0"
+    "registry.fke.fptcloud.com/xplat-fke/gardener-project/releases/gardener/coredns-config-adapter:v0.4.0"
+    "registry.fke.fptcloud.com/xplat-fke/gardener-project/releases/gardener/vpn-client:0.45.0"
+    "registry.fke.fptcloud.com/xplat-fke/gardener-project/releases/3rd/envoyproxy/envoy:distroless-v1.37.0"
+    "registry.fke.fptcloud.com/xplat-fke/cpa/cluster-proportional-autoscaler:v1.10.3"
+    "registry.fke.fptcloud.com/xplat-fke/cpa/cpvpa:v0.8.10"
+    "registry.fke.fptcloud.com/xplat-fke/alpine:3.13"
+    "europe-docker.pkg.dev/gardener-project/releases/gardener/alpine-conntrack:3.23.3"
+
+    # OpenStack Cinder CSI + sig-storage sidecars.
+    "registry.fke.fptcloud.com/xplat-fke/provider-os/cinder-csi-plugin:v1.34.2-fptcloud-csi"
+    "registry.fke.fptcloud.com/xplat-fke/sig-storage/csi-node-driver-registrar:v2.17.0"
+    "registry.fke.fptcloud.com/xplat-fke/sig-storage/livenessprobe:v2.19.0"
+)
+
+# crictl is not in the GL apt snapshot; ship a pinned binary from cri-tools.
+# Pin a version matching the kube-* images above (v1.34.x line).
+# The binary tarball is pre-downloaded on the host and mounted into the
+# builder at /mnt/crictl/ (the builder network may not reach github.com).
+CRICTL_VERSION="v1.34.0"
+case "$(uname -m)" in
+    x86_64)  CRICTL_ARCH="amd64" ;;
+    aarch64) CRICTL_ARCH="arm64" ;;
+    *) echo "ERROR: unsupported arch $(uname -m) for crictl" >&2; exit 1 ;;
+esac
+CRICTL_TARBALL="/mnt/crictl/crictl-${CRICTL_VERSION}-linux-${CRICTL_ARCH}.tar.gz"
+
+CONTAINERD_STATE="/tmp/containerd-preload-state-$$"
+CONTAINERD_SOCK="$CONTAINERD_STATE/containerd.sock"
+CONTAINERD_ROOT="$rootfs/var/lib/containerd"
+CONTAINERD_CONFIG="$rootfs/etc/containerd/config.toml"
+CONTAINERD_RUNTIME_CONFIG="$rootfs/etc/containerd/config.toml"  # persisted into the image
+
+mkdir -p "$CONTAINERD_STATE" "$CONTAINERD_ROOT" "$(dirname "$CONTAINERD_CONFIG")" "$rootfs/usr/local/bin"
+
+# Install crictl binary into the target rootfs. Version-matched to the
+# preloaded kube-* images so `crictl` works against containerd at runtime.
+if [ ! -f "$CRICTL_TARBALL" ]; then
+    echo "ERROR: crictl tarball not found at $CRICTL_TARBALL (mount it via --container-run-opts -v <host>:/mnt/crictl:ro)" >&2
+    exit 1
+fi
+echo "Installing crictl ${CRICTL_VERSION} (${CRICTL_ARCH}) from $CRICTL_TARBALL"
+tar -xzf "$CRICTL_TARBALL" -C "$rootfs/usr/local/bin" crictl
+chmod 0755 "$rootfs/usr/local/bin/crictl"
+
+# gardener/chost features remove /etc/containerd/config.toml so Gardener
+# supplies its own at runtime — create a minimal one for build-time preload
+if [ ! -f "$CONTAINERD_CONFIG" ]; then
+    cat > "$CONTAINERD_CONFIG" <<EOF
+version = 2
+root = "$CONTAINERD_ROOT"
+state = "$CONTAINERD_STATE"
+[plugins."io.containerd.snapshotter.v1.overlayfs"]
+[plugins."io.containerd.grpc.v1.cri"]
+  disable = true
+EOF
+fi
+
+cleanup() {
+    kill "$CTR_PID" 2>/dev/null || true
+    wait "$CTR_PID" 2>/dev/null || true
+    umount "$rootfs/proc" "$rootfs/sys" "$rootfs/dev" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# overlayfs snapshotter needs /proc and /sys visible under the rootfs path
+mount --bind /proc "$rootfs/proc"
+mount --bind /sys  "$rootfs/sys"
+mount --bind /dev  "$rootfs/dev"
+
+# Launch containerd with rootfs config but state+socket outside the rootfs
+# so no stale socket ends up in the final image
+containerd \
+    --config  "$rootfs/etc/containerd/config.toml" \
+    --root    "$CONTAINERD_ROOT" \
+    --state   "$CONTAINERD_STATE" \
+    --address "$CONTAINERD_SOCK" \
+    &>/tmp/containerd-preload.log &
+CTR_PID=$!
+
+echo "Waiting for containerd..."
+for i in $(seq 1 30); do
+    ctr --address "$CONTAINERD_SOCK" version &>/dev/null && break
+    sleep 1
+done
+ctr --address "$CONTAINERD_SOCK" version &>/dev/null || {
+    echo "ERROR: containerd did not start:" >&2
+    cat /tmp/containerd-preload.log >&2
+    exit 1
+}
+
+for image in "${IMAGES[@]}"; do
+    echo "Preloading: $image"
+    # Only the FKE registry needs basic auth; public registries (europe-docker,
+    # registry.k8s.io, quay.io) are pulled without credentials.
+    pull_user_args=()
+    case "$image" in
+        "$FKE_REGISTRY"/*)
+            [ -n "$REGISTRY_AUTH_USERPASS" ] && pull_user_args+=(--user "$REGISTRY_AUTH_USERPASS")
+            ;;
+    esac
+    ctr \
+        --address  "$CONTAINERD_SOCK" \
+        --namespace k8s.io \
+        images pull \
+        --snapshotter overlayfs \
+        "${pull_user_args[@]}" \
+        "$image"
+done
+
+echo "Done: preloaded ${#IMAGES[@]} images into $CONTAINERD_ROOT"
+
+# Write a persistent /etc/containerd/config.toml into the image so the
+# runtime containerd (started later by the orchestrator) inherits sensible
+# pull concurrency. The gardener feature file-excludes any pre-existing
+# config.toml, but exec.post runs last, so this one survives into the image.
+mkdir -p "$(dirname "$CONTAINERD_RUNTIME_CONFIG")"
+cat > "$CONTAINERD_RUNTIME_CONFIG" <<EOF
+version = 2
+
+[plugins."io.containerd.grpc.v1.cri"]
+  # Match the chost runtime setup (SystemdCgroup, runc v2).
+  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+    runtime_type = "io.containerd.runc.v2"
+    [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+      SystemdCgroup = true
+  [plugins."io.containerd.grpc.v1.cri".cni]
+    bin_dir = "/var/lib/containerd/io.containerd.grpc.v1.cri.cni"
+
+# Raise parallel layer fetches per pull from the default 3 to 20 so any
+# image still missing at node boot pulls much faster.
+[plugins."io.containerd.grpc.v1.cri".containerd]
+  max_concurrent_downloads = 20
+
+[plugins."io.containerd.internal.v1.opt"]
+  path = "/var/lib/containerd/io.containerd.internal.v1.opt"
+EOF
+echo "Wrote runtime containerd config with max_concurrent_downloads=20: $CONTAINERD_RUNTIME_CONFIG"

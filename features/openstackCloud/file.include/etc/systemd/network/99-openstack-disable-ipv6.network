@@ -1,0 +1,15 @@
+# OpenStack: disable IPv6 to avoid long DHCPv6/RA timeouts on VMs whose
+# OpenStack network has no IPv6. Overrides cloud feature 99-default.network
+# (DHCP=yes enables DHCPv6+RA which then wait for a response).
+# Lexical name > 99-default.network so this wins on merge.
+[Match]
+Name=en* eth*
+
+[Network]
+DHCP=ipv4
+IPv6AcceptRA=false
+LinkLocalAddressing=no
+
+[DHCPv4]
+UseDomains=true
+UseMTU=true

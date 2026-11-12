@@ -2,4 +2,9 @@
 
 set -eufo pipefail
 
-qemu-img convert -f raw -O qcow2 "$1" "$2"
+# -c enables zlib cluster compression so sparse/zero blocks left by the
+# builder's fixed-size ext4 rootfs partition are not stored in the backing
+# file. Without this the .qcow2 ships at ~the partition size (~3.4G); with it
+# the actual disk size drops to the real written data (~1.8G for a
+# preloadimages flavor with ~1.1G of preloaded container images).
+qemu-img convert -c -f raw -O qcow2 "$1" "$2"
